@@ -42,3 +42,14 @@ so.*
 
 # Debug files
 *.dSYM/
+
+# Python artefacts
+*.pyc
+*.pyd
+*egg-info/
+/Python/build/
+
+# IDE files
+/.vscode/
+/.idea/
+/.ipynb_checkpoints/

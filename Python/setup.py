@@ -1,108 +1,88 @@
-from __future__ import absolute_import
-import  os
-from os.path import join as pjoin
-from setuptools import setup, find_packages
-from distutils.extension import Extension
-from Cython.Distutils import build_ext
-import subprocess
-import numpy
+#!/usr/bin/env python
+
+import os
+# on Windows, we need the original PATH without Anaconda's compiler in it:
+PATH = os.environ.get('PATH', '')
+from distutils.spawn import find_executable
+from setuptools import setup, find_packages, Extension
+import distutils.ccompiler
+import sys
+import sysconfig
+import numpy as np
 
 
-# Code from https://github.com/rmcgibbo/npcuda-example/blob/master/cython/setup.py
+nvcc_flags = os.environ.get('NVCCFLAGS', '').split()
 
-
-def find_in_path(name, path):
-    "Find a file in a search path"
-    # adapted fom http://code.activestate.com/recipes/52224-find-a-file-given-a-search-path/
-    for dir in path.split(os.pathsep):
-        binpath = pjoin(dir, name)
-        if os.path.exists(binpath):
-            return os.path.abspath(binpath)
-    return None
-
-
-def locate_cuda():
-    """Locate the CUDA environment on the system
-
-    Returns a dict with keys 'home', 'nvcc', 'include', and 'lib64'
-    and values giving the absolute path to each directory.
-
-    Starts by looking for the CUDAHOME env variable. If not found, everything
-    is based on finding 'nvcc' in the PATH.
-    """
-
-    # first check if the CUDAHOME env variable is in use
-    if 'CUDAHOME' in os.environ:
-        home = os.environ['CUDAHOME']
-        nvcc = pjoin(home, 'bin', 'nvcc')
-        lib64 = pjoin(home, 'lib64')
-    elif 'CUDA_PATH' in os.environ:
-        home = os.environ['CUDA_PATH']
-        nvcc = pjoin(home, 'bin', 'nvcc.exe')
-        lib64 = pjoin(home, 'lib/x64')
+if os.name == 'nt' and not '--compiler-bindir' in ''.join(nvcc_flags):
+    dirname = os.path.dirname(find_executable("cl.exe", PATH) or '')
+    if dirname:
+        nvcc_flags.extend(['--compiler-bindir', dirname])
     else:
-        # otherwise, search the PATH for NVCC
-        nvcc = find_in_path('nvcc', os.environ['PATH'])
-        if nvcc is None:
-            raise EnvironmentError('The nvcc binary could not be located in your $PATH. '
-                                   'Either add it to your path, or set $CUDAHOME')
-        home = os.path.dirname(os.path.dirname(nvcc))
+        import warnings
+        warnings.warn("MSVC (cl.exe) not found on PATH. Compilation may "
+                      "fail. Either set PATH to include the path to MSVC, "
+                      "or set NVCCFLAGS=--compiler-bindir=... to define "
+                      "it. Possibly also set NVCCFLAGS=--cl-version=2010 "
+                      "to override nvcc's MSVC version detection.")
+nvcc_flags.extend(['-arch=sm_30', '--ptxas-options=-v', '-c'])
 
-    cudaconfig = {'home': home, 'nvcc': nvcc,
-                  'include': pjoin(home, 'include'),
-                  'lib64': lib64}
-    for k, v in cudaconfig.iteritems():
-        if not os.path.exists(v):
-            raise EnvironmentError('The CUDA %s path could not be located in %s' % (k, v))
+cuda_path = os.environ.get('CUDA_PATH')
+libs = ['cudart', 'python27']
+libs_dirs = [os.path.join(cuda_path, 'lib/x64')]
+libs_dirs.extend([os.path.normpath(r"C:\Users\Edoardo\Anaconda3\envs\tigre\libs")])
 
-    return cudaconfig
-
-
-CUDA = locate_cuda()
 
 # Obtain the numpy include directory.  This logic works across numpy versions.
 try:
-    numpy_include = numpy.get_include()
+    numpy_include = np.get_include()
 except AttributeError:
-    numpy_include = numpy.get_numpy_include()
+    numpy_include = np.get_numpy_include()
 
 
-def customize_compiler_for_nvcc(self):
-    """inject deep into distutils to customize how the dispatch
-    to gcc/nvcc works.
+# We define a compiler for the extensions defined above:
+class NVCCCompiler(distutils.ccompiler.CCompiler):
+    """
+    Custom CCompiler class that invokes nvcc no matter what.
+    """
+    compiler_type = 'nvcc'
+    executables = {}
+    src_extensions = ('.cu','.cpp')
+    obj_extension = '.o' if os.name != 'nt' else '.obj'
+    shared_lib_extension = sysconfig.get_config_var('SO')
 
-    If you subclass UnixCCompiler, it's not trivial to get your subclass
-    injected in, and still have the right customizations (i.e.
-    distutils.sysconfig.customize_compiler) run on it. So instead of going
-    the OO route, I have this. Note, it's kindof like a wierd functional
-    subclassing going on."""
+    def _compile(self, obj, src, ext, cc_args, extra_postargs, pp_opts):
+        assert ext == '.cu' or ext == '.cpp'
+        cmd = ['nvcc', '-O'] + cc_args + [src, '-o', obj] + (
+            ['--compiler-options=-fPIC'] if os.name != 'nt' else []) + extra_postargs + pp_opts
+        self.spawn(cmd)
 
-    # tell the compiler it can processes .cu
-    self.src_extensions.append('.cu')
+    def link(self, target_desc, objects, output_filename, output_dir=None,
+             libraries=None, library_dirs=None, runtime_library_dirs=None,
+             export_symbols=None, debug=0, extra_preargs=None,
+             extra_postargs=None, build_temp=None, target_lang=None):
+        if output_dir is not None:
+            output_filename = os.path.join(output_dir, output_filename)
+        self.mkpath(os.path.dirname(output_filename))
+        self.spawn(['nvcc'] + (extra_preargs or []) +
+                   ['--shared', '-o', output_filename] + objects +
+                   list('-l%s' % lib for lib in libraries
+                        if not lib.startswith('python')) +
+                   list('-L%s' % libdir for libdir in library_dirs) +
+                   (extra_postargs or []) + (['-G'] if debug else []))
 
-    # save references to the default compiler_so and _comple methods
-    default_compiler_so = self.compiler_so
-    super = self._compile
 
-    # now redefine the _compile method. This gets executed for each
-    # object but distutils doesn't have the ability to change compilers
-    # based on source extension: we add it.
-    def _compile(obj, src, ext, cc_args, extra_postargs, pp_opts):
-        if os.path.splitext(src)[1] == '.cu':
-            # use the cuda for .cu files
-            self.set_executable('compiler_so', CUDA['nvcc'])
-            # use only a subset of the extra_postargs, which are 1-1 translated
-            # from the extra_compile_args in the Extension class
-            postargs = extra_postargs['nvcc']
-        else:
-            postargs = extra_postargs['gcc']
+# We want setuptools to use NVCCCompiler. The compiler is instantiated in
+# build_ext.run(), so we could write a custom build_ext command for this.
+# However, build_ext.run() does a lot of other stuff, so we would have to
+# copy the full method. To avoid this, we monkey-patch the function used
+# to instantiate the compiler at the beginning of build_ext.run():
 
-        super(obj, src, ext, cc_args, postargs, pp_opts)
-        # reset the default compiler_so, which we might have changed for cuda
-        self.compiler_so = default_compiler_so
+def new_compiler(plat=None, compiler=None, verbose=0, dry_run=0, force=0):
+    return NVCCCompiler(verbose, dry_run, force)
 
-    # inject our redefined _compile method into the class
-    self._compile = _compile
+distutils.ccompiler.new_compiler = new_compiler
+
+
 
 Ax_ext = Extension('_Ax',
                    sources=(['tigre/Source/projection.cpp',
@@ -110,51 +90,35 @@ Ax_ext = Extension('_Ax',
                              'tigre/Source/ray_interpolated_projection.cu', 'tigre/Source/ray_interpolated_projection_parallel.cu',
                              'tigre/Source/_types.pxd',
                              'tigre/Source/_Ax.pyx']),
-                   library_dirs=[CUDA['lib64']],
-                   libraries=['cudart'],
+                   library_dirs=libs_dirs,
+                   libraries=libs,
+                   runtime_library_dirs=libs_dirs,
                    language='c++',
-                   runtime_library_dirs=[CUDA['lib64']],
-                   # this syntax is specific to this build system
-                   # we're only going to use certain compiler args with nvcc and not with gcc
-                   # the implementation of this trick is in customize_compiler() below
-                   extra_compile_args={'gcc': [],
-                                        'nvcc': ['-arch=sm_20', '--ptxas-options=-v', '-c',
-                                                 '--compiler-options', "'-fPIC'"]},
-                   include_dirs=[numpy_include, CUDA['include'], 'Source'])
+                   extra_compile_args=nvcc_flags,
+                   include_dirs=[numpy_include, 'tigre/Source'])
 
 Atb_ext = Extension('_Atb',
                     sources=(['tigre/Source/voxel_backprojection.cu', 'tigre/Source/voxel_backprojection2.cu',
                               'tigre/Source/voxel_backprojection_parallel.cu',
                               'tigre/Source/_types.pxd',
                               'tigre/Source/_Atb.pyx']),
-                    library_dirs=[CUDA['lib64']],
-                    libraries=['cudart'],
+                    library_dirs=libs_dirs,
+                    libraries=libs,
+                    runtime_library_dirs=libs_dirs,
                     language='c++',
-                    runtime_library_dirs=[CUDA['lib64']],
-                    # this syntax is specific to this build system
-                    # we're only going to use certain compiler args with nvcc and not with gcc
-                    # the implementation of this trick is in customize_compiler() below
-                    extra_compile_args={'gcc': [],
-                                         'nvcc': ['-arch=sm_20', '--ptxas-options=-v', '-c',
-                                                  '--compiler-options', "'-fPIC'"]},
-                    include_dirs=[numpy_include, CUDA['include'], 'Source'])
+                    extra_compile_args=nvcc_flags,
+                    include_dirs=[numpy_include, 'tigre/Source'])
 
-# run the customize_compiler
-class custom_build_ext(build_ext):
-    def build_extensions(self):
-        customize_compiler_for_nvcc(self.compiler)
-        build_ext.build_extensions(self)
-
+ext_mods = [Ax_ext, Atb_ext]
 
 setup(name='tigre',
       version = '0.0.0',
       author = 'Reuben Lindroos',
       packages = find_packages(),
       include_package_data=True,
-      ext_modules=[Ax_ext, Atb_ext],
-
-      # inject our custom trigger
-      cmdclass={'build_ext': custom_build_ext},
+      ext_modules=ext_mods,
 
       # since the package has c code, the egg cannot be zipped
       zip_safe=False)
+
+
